@@ -1,0 +1,29 @@
+# Dataset files
+dataset/
+*.zip
+
+# Audio files
+*.ogg
+*.egg
+*.mp3
+*.wav
+
+# Model outputs
+beatsaber_model/
+runs/
+checkpoints/
+
+# Cache directories
+__pycache__/
+*.pyc
+.cache/
+/tmp/bs_cache/
+
+# Jupyter/IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db 
