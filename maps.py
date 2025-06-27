@@ -30,6 +30,22 @@ from torch.utils.data import Dataset
 import soundfile as sf
 import glob
 
+def encode_note(x, y, color, direction):
+    """Encode Beat Saber note position/color/direction to note type.
+    Returns raw type value (0-179), data layer will add token offset."""
+    # Position (3x3 grid) * 20 + color (0/1) * 10 + direction (0-9)
+    note_type = (y * 3 + x) * 20 + color * 10 + direction
+    return note_type
+
+def decode_note(note_type):
+    """Decode note type back to note properties."""
+    direction = note_type % 10
+    color = (note_type // 10) % 2
+    position = note_type // 20
+    y = position // 3
+    x = position % 3
+    return x, y, color, direction
+
 def parse_note(note: dict) -> tuple[float, int, int, int, int]:
     """
     Parse a note from either old or new format.
@@ -99,14 +115,10 @@ def load_map(path: Union[str, Path]) -> List[Tuple[float, int]]:
         assert 0 <= color <= 1, f"Invalid color: {color}"
         assert 0 <= direction <= 9, f"Invalid direction: {direction}"
         
-        # Convert beat to ticks
-        time = beat * 12
+        # Encode note type using standard function
+        note_type = encode_note(x, y, color, direction)
         
-        # Encode note type
-        position_idx = y * 3 + x
-        note_type = position_idx * 20 + color * 10 + direction
-        
-        notes.append((time, note_type))
+        notes.append((beat, note_type))
     
     # Sort by time
     notes.sort()
@@ -169,17 +181,13 @@ class ZippedBeatSaberDataset(Dataset):
                     assert 0 <= color <= 1, f"Invalid color: {color}"
                     assert 0 <= direction <= 9, f"Invalid direction: {direction}"
                     
-                    # Convert beat to ticks
-                    time = beat * 12
+                    # Encode note type using standard function
+                    note_type = encode_note(x, y, color, direction)
                     
-                    # Encode note type
-                    position_idx = y * 3 + x
-                    note_type = position_idx * 20 + color * 10 + direction
-                    
-                    notes.append((time, note_type))
+                    notes.append((beat, note_type))
                 
                 notes.sort()  # Sort by time
-                notes = np.array(notes, dtype=np.float32)
+                # notes = [(beat_time, note_type), ...] - beat times and encoded types 0-179
             
             # Load audio
             with zf.open('song.egg') as f:
@@ -193,27 +201,19 @@ class ZippedBeatSaberDataset(Dataset):
                 if audio.ndim == 1:
                     audio = audio.reshape(1, -1)  # [channels, samples]
                 
+                # Returns: (audio, notes, bpm)
+                # audio = (1, samples) - mono audio ready for encodec
+                # notes = [(beat, type), ...] - list of note tuples
+                # bpm = float - beats per minute
                 return audio, notes, bpm
 
 def convert_to_v3_format(notes, bpm):
     """Convert simple note format to Beat Saber v3 format."""
-    # Decode type integer back to components
-    def decode_note_type(type_int):
-        position = type_int // 20
-        remaining = type_int % 20
-        color = remaining // 10
-        direction = remaining % 10
-        
-        # Extract x,y from position
-        y = position // 3
-        x = position % 3
-        
-        return x, y, color, direction
-
+    
     # Convert each note
     color_notes = []
     for note in notes:
-        x, y, color, direction = decode_note_type(note["type"])
+        x, y, color, direction = decode_note(note["type"])
         
         color_notes.append({
             "b": float(note["time"]),  # Beat time

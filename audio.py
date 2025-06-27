@@ -13,7 +13,10 @@ def create_audio_tokenizer(bandwidth=1.5):
     return tokenizer
 
 class AudioTokenizer:
-    """Handles conversion between raw audio and Encodec tokens."""
+    """Handles conversion between raw audio and Encodec tokens.
+    
+    The Encodec model runs on GPU (if available) as per spec requirement.
+    Results are returned as CPU numpy arrays for efficient caching."""
     
     def __init__(
         self,
@@ -91,6 +94,7 @@ class AudioTokenizer:
         
         # Convert to numpy - codes shape is (batch, codebooks, frames)
         # We want (frames, codebooks)
+        # Note: We return CPU numpy for caching/storage, but encoding happened on GPU
         result = codes.squeeze(0).T.cpu().numpy()
             
         return result
