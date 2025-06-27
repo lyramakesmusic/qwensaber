@@ -3,10 +3,15 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 import numpy as np
-from encodec import EncodecModel
+from encodec import EncodecModel  # type: ignore[attr-defined]
 from encodec.utils import convert_audio
 
-def create_audio_tokenizer(bandwidth=1.5):
+from config import SAMPLE_RATE, ENCODEC_BANDWIDTH, get_logger
+
+
+logger = get_logger(__name__)
+
+def create_audio_tokenizer(bandwidth: float = ENCODEC_BANDWIDTH) -> 'AudioTokenizer':
     """Create audio tokenizer with specified settings."""
     tokenizer = AudioTokenizer()
     tokenizer._ensure_model_loaded(bandwidth)
@@ -21,17 +26,18 @@ class AudioTokenizer:
     def __init__(
         self,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        sample_rate: int = 24000,
-        chunk_size: int = 24000 * 30,  # 30 seconds
+        sample_rate: int = SAMPLE_RATE,
+        chunk_size: int = SAMPLE_RATE * 30,  # 30 seconds
     ):
         self.device = device
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.model = None  # Lazy load to avoid CUDA fork issues
         
-    def _ensure_model_loaded(self, bandwidth=1.5):
+    def _ensure_model_loaded(self, bandwidth=ENCODEC_BANDWIDTH):
         """Lazy load the model to avoid CUDA initialization in main process."""
         if self.model is None:
+            logger.info(f"Loading Encodec model with bandwidth {bandwidth}")
             self.model = EncodecModel.encodec_model_24khz()
             self.model = self.model.to(self.device)
             self.model.set_target_bandwidth(bandwidth)
@@ -42,9 +48,12 @@ class AudioTokenizer:
         """
         Convert raw audio to Encodec codebook indices.
         
+        IMPORTANT: Audio must be resampled to 24kHz by caller before encoding!
+        This function does NOT handle resampling automatically.
+        
         Args:
             audio: Audio array of shape [channels, samples] or [samples]
-                  Values should be in [-1, 1] range
+                  Values should be in [-1, 1] range and sampled at 24kHz
                   
         Returns:
             Array of shape [frames, N] containing codebook indices where N depends on bandwidth
@@ -72,9 +81,8 @@ class AudioTokenizer:
         # Add channel dimension for Encodec (expects [1, samples] for mono)
         audio = audio.unsqueeze(0)  # Now [1, samples]
             
-        # Ensure correct sample rate
-        if hasattr(audio, 'sample_rate') and audio.sample_rate != self.sample_rate:
-            audio = convert_audio(audio, audio.sample_rate, self.sample_rate)
+        # Note: Audio resampling should be handled by caller if needed
+        # We expect 24kHz audio as input
         
         # Add batch dimension for Encodec: (batch, channels, samples)
         audio = audio.unsqueeze(0)  # Now [1, 1, samples]
@@ -82,13 +90,7 @@ class AudioTokenizer:
         # Move to device
         audio = audio.to(self.device)
         
-        # Pad if needed - pad the sample dimension (last dimension)
-        original_length = audio.shape[-1]
-        if audio.shape[-1] % self.chunk_size != 0:
-            pad_length = self.chunk_size - (audio.shape[-1] % self.chunk_size)
-            audio = F.pad(audio, (0, pad_length))
-            
-        # Encode
+        # Encode - encodec handles variable length audio
         encoded_frames = self.model.encode(audio)
         codes = torch.cat([encoded[0] for encoded in encoded_frames], dim=-1)
         
@@ -114,18 +116,18 @@ class AudioTokenizer:
         
         # Convert to torch
         if isinstance(codes, np.ndarray):
-            codes = torch.from_numpy(codes)
+            codes = torch.from_numpy(codes).long()  # Ensure integer type
         
-        # Move to device and unsqueeze batch
+        # codes shape is [frames, codebooks]
+        # Transpose to [codebooks, frames] then add batch dimension
+        codes = codes.T.unsqueeze(0)  # Now [1, codebooks, frames]
+        
+        # Move to device
         codes = codes.to(self.device)
-        if codes.dim() == 2:
-            codes = codes.unsqueeze(0)
         
-        # Prepare format expected by encodec
-        codes_list = [codes[:, :, i] for i in range(codes.shape[-1])]
+        # Decode - encodec expects list of [(codes, scales)]
+        # where codes is [batch, codebooks, frames]
+        audio = self.model.decode([(codes, None)])
         
-        # Decode
-        audio = self.model.decode([(codes_list, None)])[0]
-        
-        # Convert to numpy
-        return audio.cpu().numpy() 
+        # Convert to numpy - shape is [batch, channels, samples]
+        return audio[0].cpu().numpy() 

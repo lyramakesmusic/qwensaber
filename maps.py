@@ -25,28 +25,33 @@ import numpy as np
 from pathlib import Path
 import zipfile
 import io
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Dict, Any, Optional
 from torch.utils.data import Dataset
 import soundfile as sf
 import glob
+from functools import lru_cache
+import threading
 
-def encode_note(x, y, color, direction):
-    """Encode Beat Saber note position/color/direction to note type.
-    Returns raw type value (0-179), data layer will add token offset."""
-    # Position (3x3 grid) * 20 + color (0/1) * 10 + direction (0-9)
-    note_type = (y * 3 + x) * 20 + color * 10 + direction
-    return note_type
+from config import get_logger
 
-def decode_note(note_type):
-    """Decode note type back to note properties."""
+logger = get_logger(__name__)
+
+def encode_note(x: int, y: int, color: int, direction: int) -> int:
+    """Encode note position into single integer."""
+    return (y * 3 + x) * 20 + color * 10 + direction
+
+def decode_note(note_type: int) -> Tuple[int, int, int, int]:
+    """Decode note integer back to position components."""
     direction = note_type % 10
-    color = (note_type // 10) % 2
-    position = note_type // 20
-    y = position // 3
-    x = position % 3
+    note_type //= 10
+    color = note_type % 2
+    note_type //= 2
+    combined = note_type
+    x = combined % 3
+    y = combined // 3
     return x, y, color, direction
 
-def parse_note(note: dict) -> tuple[float, int, int, int, int]:
+def parse_note(note: Dict[str, Any]) -> Optional[Tuple[float, int, int, int, int]]:
     """
     Parse a note from either old or new format.
     Returns (beat, x, y, color, direction)
@@ -110,10 +115,14 @@ def load_map(path: Union[str, Path]) -> List[Tuple[float, int]]:
         beat, x, y, color, direction = parsed
         
         # Validate ranges
-        assert 0 <= x <= 3, f"Invalid x position: {x}"
-        assert 0 <= y <= 2, f"Invalid y position: {y}"
-        assert 0 <= color <= 1, f"Invalid color: {color}"
-        assert 0 <= direction <= 9, f"Invalid direction: {direction}"
+        if not (0 <= x <= 3):
+            raise ValueError(f"Invalid x position: {x}")
+        if not (0 <= y <= 2):
+            raise ValueError(f"Invalid y position: {y}")
+        if not (0 <= color <= 1):
+            raise ValueError(f"Invalid color: {color}")
+        if not (0 <= direction <= 9):
+            raise ValueError(f"Invalid direction: {direction}")
         
         # Encode note type using standard function
         note_type = encode_note(x, y, color, direction)
@@ -143,16 +152,42 @@ class ZippedBeatSaberDataset(Dataset):
         if not self.zip_files:
             raise ValueError(f"No .zip files found in {maps_dir}")
             
-        print(f"Found {len(self.zip_files)} map archives")
+        logger.info(f"Found {len(self.zip_files)} map archives")
+        
+        # Cache for open zip files - prevents thrashing
+        self._zip_cache = {}
+        self._cache_size = 10  # Keep last 10 zips open
+        self._cache_lock = threading.Lock()  # Thread safety for DataLoader workers
         
     def __len__(self):
         return len(self.zip_files)
     
+    def _get_zip(self, zip_path: Path) -> zipfile.ZipFile:
+        """Get cached ZipFile handle or create new one. Thread-safe for DataLoader workers."""
+        path_str = str(zip_path)
+        
+        with self._cache_lock:
+            if path_str not in self._zip_cache:
+                # Evict oldest if cache full
+                if len(self._zip_cache) >= self._cache_size:
+                    oldest = next(iter(self._zip_cache))
+                    try:
+                        self._zip_cache[oldest].close()
+                    except Exception:
+                        pass  # Ignore errors on close, file might be corrupted
+                    del self._zip_cache[oldest]
+                
+                # Open and cache new zip
+                self._zip_cache[path_str] = zipfile.ZipFile(zip_path, 'r')
+        
+        return self._zip_cache[path_str]
+    
     def __getitem__(self, idx: int):
         zip_path = self.zip_files[idx]
-        print(f"[ZippedBeatSaberDataset] Loading {zip_path.name}")
+        logger.debug(f"Loading map archive: {zip_path.name}")
         
-        with zipfile.ZipFile(zip_path) as zf:
+        zf = self._get_zip(zip_path)
+        try:
             # Load Info.dat for BPM
             with zf.open('Info.dat') as f:
                 info = json.load(f)
@@ -176,10 +211,14 @@ class ZippedBeatSaberDataset(Dataset):
                     beat, x, y, color, direction = parsed
                     
                     # Validate ranges
-                    assert 0 <= x <= 3, f"Invalid x position: {x}"
-                    assert 0 <= y <= 2, f"Invalid y position: {y}"
-                    assert 0 <= color <= 1, f"Invalid color: {color}"
-                    assert 0 <= direction <= 9, f"Invalid direction: {direction}"
+                    if not (0 <= x <= 3):
+                        raise ValueError(f"Invalid x position: {x}")
+                    if not (0 <= y <= 2):
+                        raise ValueError(f"Invalid y position: {y}")
+                    if not (0 <= color <= 1):
+                        raise ValueError(f"Invalid color: {color}")
+                    if not (0 <= direction <= 9):
+                        raise ValueError(f"Invalid direction: {direction}")
                     
                     # Encode note type using standard function
                     note_type = encode_note(x, y, color, direction)
@@ -206,6 +245,9 @@ class ZippedBeatSaberDataset(Dataset):
                 # notes = [(beat, type), ...] - list of note tuples
                 # bpm = float - beats per minute
                 return audio, notes, bpm
+        except Exception as e:
+            logger.error(f"Error loading {zip_path.name}: {e}")
+            raise
 
 def convert_to_v3_format(notes, bpm):
     """Convert simple note format to Beat Saber v3 format."""

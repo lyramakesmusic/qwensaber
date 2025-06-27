@@ -1,11 +1,30 @@
-torch>=2.0.0
-torchaudio>=2.0.0
-numpy>=1.24.0
-encodec>=0.1.1  # For audio encoding/decoding
-soundfile>=0.12.1  # For audio file I/O 
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
-transformers>=4.36.0
-datasets>=2.14.0
-peft>=0.6.0
-trl>=0.7.0
-xformers 
+# Beat Saber AI Dependencies
+# Tested with CUDA 11.8, Python 3.10
+
+# Core ML
+torch==2.1.0
+torchaudio==2.1.0
+transformers==4.37.2
+datasets==2.16.1
+trl==0.7.10
+bitsandbytes==0.41.3
+peft==0.7.1
+
+# Audio processing
+encodec==0.1.1
+soundfile==0.12.1
+librosa==0.10.1
+
+# Unsloth - install from github
+# pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+
+# Utils
+numpy==1.24.4
+scipy==1.11.4
+huggingface-hub==0.20.2
+
+# Development
+pytest==7.4.4
+black==23.12.1
+flake8==7.0.0
+mypy==1.8.0 

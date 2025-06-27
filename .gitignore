@@ -8,6 +8,9 @@ dataset/
 *.mp3
 *.wav
 
+# Misc
+misc/
+
 # Model outputs
 beatsaber_model/
 runs/

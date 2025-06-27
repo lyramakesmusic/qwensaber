@@ -17,43 +17,48 @@ import pickle
 import hashlib
 from pathlib import Path
 from torch.utils.data import Dataset
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional, Union
 
 from audio import create_audio_tokenizer
 
-# Constants
-PPQ = 48  # Pulses per quarter note
-VOCAB_SIZE = 14522  # Total tokens we use from Qwen3's vocabulary (0-14521)
+from config import (
+    PPQ, VOCAB_SIZE, 
+    TIME_TICK_RANGE as TIME_RANGE,
+    NOTE_TYPE_RANGE as NOTE_RANGE, 
+    AUDIO_TOKEN_RANGE as AUDIO_RANGE,
+    SpecialTokens,
+    ENCODEC_FPS,
+    DEFAULT_CACHE_DIR, get_logger
+)
 
-# Token ranges
-TIME_RANGE = (0, 12288)      # 12,288 time ticks
-NOTE_RANGE = (12288, 12468)  # 180 note types
-AUDIO_RANGE = (12468, 14516) # 2,048 audio tokens (2 codebooks × 1,024 values)
+logger = get_logger(__name__)
 
-# Special tokens packed right after audio range
-BOS = 14516        # Beginning of sequence
-EOS = 14517        # End of sequence
-PAD = 14518        # Padding
-AUDIO_START = 14519  # Start of audio tokens
-AUDIO_END = 14520    # End of audio tokens
-NOTES_START = 14521  # Start of note tokens
+# Import special tokens for backward compatibility
+BOS = SpecialTokens.BOS
+EOS = SpecialTokens.EOS
+PAD = SpecialTokens.PAD
+AUDIO_START = SpecialTokens.AUDIO_START
+AUDIO_END = SpecialTokens.AUDIO_END
+NOTES_START = SpecialTokens.NOTES_START
 
 
 # encoding / decoding data
 # -------------------------------------------------------------------
 
-def time_to_token(beat_time):
-
+def time_to_token(beat_time: float) -> int:
     """Convert beat time to time token."""
-
     tick = int(round(beat_time * PPQ))
     return min(tick, TIME_RANGE[1] - 1)
 
-def audio_tokens_to_sequence(audio_tokens):
-
-    """Convert Encodec audio tokens to our token sequence."""
-
-    # audio_tokens = (frames, 2) - frames of 2 codebooks, values 0-1023
+def audio_tokens_to_sequence(audio_tokens: np.ndarray) -> List[int]:  # type: ignore[type-arg]
+    """Convert Encodec audio tokens to our token sequence.
+    
+    Args:
+        audio_tokens: Tensor[frames, 2] with values 0-1023 from Encodec
+        
+    Returns:
+        List of tokens in range 12468-14515 (length = frames * 2)
+    """
     sequence = []
     n_codebooks = audio_tokens.shape[1]
     values_per_codebook = (AUDIO_RANGE[1] - AUDIO_RANGE[0]) // n_codebooks
@@ -66,23 +71,27 @@ def audio_tokens_to_sequence(audio_tokens):
             token = AUDIO_RANGE[0] + slot * values_per_codebook + scaled_value
             sequence.append(int(token))
     
-    # Returns: List[int] - flattened tokens in range 12468-14515
     return sequence
 
-def create_training_sequence(audio_tokens, notes):
-
+def create_training_sequence(audio_tokens: np.ndarray, notes: List[Tuple[float, int]]) -> List[int]:
     """Create a training sequence from audio tokens and notes.
-    [BOS, AUDIO_START, audio_tokens, AUDIO_END, NOTES_START, time_token, note_token, ... EOS]"""
-
-    # audio_tokens = (frames, 2) - encodec output
-    # notes = [(beat_time, note_type), ...] - beat times and note types (0-179)
     
-    sequence = [BOS, AUDIO_START]
+    Format: [BOS, AUDIO_START, audio_tokens, AUDIO_END, NOTES_START, time_token, note_token, ... EOS]
+    
+    Args:
+        audio_tokens: Tensor[frames, 2] - Encodec output tokens
+        notes: [(beat_time, note_type), ...] - beat times and note types (0-179)
+        
+    Returns:
+        Complete training sequence as list of token IDs
+    """
+    
+    sequence: List[int] = [BOS, AUDIO_START]
     
     audio_seq = audio_tokens_to_sequence(audio_tokens)
-    sequence.extend(audio_seq)
+    sequence.extend(audio_seq)  # type: ignore[arg-type]
     
-    sequence.extend([AUDIO_END, NOTES_START])
+    sequence.extend([AUDIO_END, NOTES_START])  # type: ignore[arg-type]
 
     note_tokens_created = []
     for beat_time, note_type in notes:
@@ -100,11 +109,15 @@ def create_training_sequence(audio_tokens, notes):
 # collator
 # -------------------------------------------------------------------
 
-def audio_masking_collator(batch):
-
-    """Custom collator for audio masking."""
-
-    # batch = [{"input_ids": tensor, "attention_mask": tensor}, ...]
+def audio_masking_collator(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Custom collator for audio masking.
+    
+    Args:
+        batch: List of dicts with "input_ids" and "attention_mask" tensors
+        
+    Returns:
+        Dict with batched "input_ids", "attention_mask", and "labels"
+    """
     
     # Find max length in batch for padding
     # Handle both tensors and lists
@@ -171,6 +184,21 @@ def audio_masking_collator(batch):
     }
 
 
+# Worker initialization for DataLoader
+# -------------------------------------------------------------------
+
+def worker_init_fn(worker_id: int) -> None:
+    """
+    Initialize DataLoader worker to avoid GPU conflicts.
+    
+    Each worker should use CPU for encoding to avoid GPU memory conflicts,
+    or share the model from main process.
+    """
+    import os
+    # Force workers to use CPU to avoid multiple GPU model copies
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+
 # dataset class
 # -------------------------------------------------------------------
 
@@ -180,15 +208,22 @@ class BeatsDataset(Dataset):
     Wraps a ZippedBeatSaberDataset and handles chunking with caching.
     """
 
-    def __init__(self, base_dataset, chunk_duration=30.0, max_seq_length=32767, cache_dir="/tmp/bs_cache"):
-
-        # base_dataset is a ZippedBeatSaberDataset (directory of zip files passed to it)
+    def __init__(self, base_dataset: Dataset, chunk_duration: float = 30.0, 
+                 max_seq_length: int = 32767, cache_dir: Optional[Union[str, Path]] = None) -> None:
+        """Initialize chunking dataset wrapper.
+        
+        Args:
+            base_dataset: ZippedBeatSaberDataset instance
+            chunk_duration: Duration of audio chunks in seconds
+            max_seq_length: Maximum sequence length for model
+            cache_dir: Directory for caching encoded audio
+        """
         self.base = base_dataset 
         self.chunk_duration = chunk_duration
         self.max_seq_length = max_seq_length
         
         # cache_dir for storing encoded audio
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
         self.cache_dir.mkdir(exist_ok=True)
         
         # encodec model singleton
@@ -201,69 +236,103 @@ class BeatsDataset(Dataset):
             self.audio_tokenizer = create_audio_tokenizer(bandwidth=1.5)
         return self.audio_tokenizer
     
-    def _get_cache_key(self, idx):
+    def _get_cache_key(self, idx: int) -> str:
         """Generate cache key for sample."""
-        # Include all parameters that affect output
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        key = f"sample_{idx}_dur{self.chunk_duration}_max{self.max_seq_length}_ppq{PPQ}_bw1.5_{device}_v3"
+        # Hash based on content and version, not device
+        # This way cache works across GPU/CPU switches
+        zip_path = self.base.zip_files[idx]
+        zip_stat = zip_path.stat()
+        content_hash = f"{zip_path.name}_{zip_stat.st_size}_{zip_stat.st_mtime}"
+        version = "v4"  # Increment when changing encoding logic
+        key = f"{content_hash}_ppq{PPQ}_bw1.5_{version}"
         return hashlib.md5(key.encode()).hexdigest()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.base)
 
-    def __getitem__(self, idx):
+    def _load_cache(self, idx: int, cache_key: str) -> Tuple[Optional[np.ndarray], Optional[List[Tuple[float, int]]], Optional[float]]:  # type: ignore[type-arg]
+        """Load cached audio tokens, notes, and BPM if available.
         
-        # Check cache first
-        cache_key = self._get_cache_key(idx)
+        Args:
+            idx: Sample index
+            cache_key: Cache key for this sample
+            
+        Returns:
+            Tuple of (audio_tokens, notes, bpm) or (None, None, None) if cache miss
+        """
         cache_path = self.cache_dir / f"{cache_key}.pkl"
         
-        if cache_path.exists():
-            try:
-                with open(cache_path, 'rb') as f:
-                    cached_data = pickle.load(f)
-                    audio_tokens = cached_data['audio_tokens']
-                    notes = cached_data['notes']
-                    bpm = cached_data['bpm']
-            except Exception as e:
-                cache_path.unlink()  # Remove corrupted cache
-                # Fall through to regenerate
-                audio_tokens = None
-        else:
-            audio_tokens = None
+        if not cache_path.exists():
+            return None, None, None
+            
+        try:
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+                return cached_data['audio_tokens'], cached_data['notes'], cached_data['bpm']
+        except Exception as e:
+            logger.warning(f"Failed to load cache, removing corrupted file: {e}")
+            cache_path.unlink()  # Remove corrupted cache
+            return None, None, None
+
+    def _encode_audio(self, idx: int, cache_key: str) -> Tuple[np.ndarray, List[Tuple[float, int]], float]:  # type: ignore[type-arg]
+        """Encode audio with Encodec and save to cache.
         
-        # If not cached, load and encode
-        if audio_tokens is None:
-            audio, notes, bpm = self.base[idx]
+        Args:
+            idx: Sample index
+            cache_key: Cache key for saving
             
-            # Encode audio with encodec (expensive operation)
-            # Note: Encodec model runs on GPU as per spec
-            audio_tokens = self._get_audio_tokenizer().encode(audio)
+        Returns:
+            Tuple of (audio_tokens, notes, bpm) where audio_tokens shape is (frames, 2)
+        """
+        audio, notes, bpm = self.base[idx]
+        
+        # Encode audio with encodec (expensive operation)
+        # Note: Encodec model runs on GPU as per spec
+        audio_tokens = self._get_audio_tokenizer().encode(audio)
+        
+        # Save to cache
+        cache_path = self.cache_dir / f"{cache_key}.pkl"
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump({
+                    'audio_tokens': audio_tokens,
+                    'notes': notes,
+                    'bpm': bpm
+                }, f)
+        except Exception as e:
+            logger.warning(f"Failed to cache encoded audio: {e}")
+            # Continue anyway, will regenerate next time
             
-            # Save to cache
-            try:
-                with open(cache_path, 'wb') as f:
-                    pickle.dump({
-                        'audio_tokens': audio_tokens,
-                        'notes': notes,
-                        'bpm': bpm
-                    }, f)
-            except Exception as e:
-                pass  # Fail silently, will regenerate next time
+        return audio_tokens, notes, bpm
 
-        # Now do chunking
-        bps = bpm / 60
-        fps = 100
-        total_beats = len(audio_tokens) / fps * bps
-
+    def _slice_chunk(self, audio_tokens: np.ndarray, notes: List[Tuple[float, int]], bpm: float, cache_key: str, idx: int) -> Tuple[np.ndarray, List[Tuple[float, int]]]:  # type: ignore[type-arg]
+        """Slice audio and notes into training chunks.
+        
+        Args:
+            audio_tokens: Encoded audio tokens, shape (frames, 2)
+            notes: List of (beat_time, note_type) tuples
+            bpm: Beats per minute
+            cache_key: For deterministic offset calculation
+            idx: Sample index for offset calculation
+            
+        Returns:
+            Tuple of (audio_chunk, notes_chunk) where:
+                audio_chunk shape is (chunk_frames, 2)
+                notes_chunk is [(relative_time, note_type), ...]
+        """
         if self.chunk_duration is None:
-            return create_training_sequence(audio_tokens, notes)
+            # Return full audio/notes without chunking
+            return audio_tokens, notes
         
-        # Calculate chunks and note alignment
-        # and slice chunks out correctly
-
+        bps = bpm / 60
+        fps = ENCODEC_FPS
+        total_beats = len(audio_tokens) / fps * bps
         chunk_beats = self.chunk_duration * bps
-        # Use deterministic offset based on idx for reproducibility
-        offset_ratio = (idx % 10) / 10.0 
+        
+        # Use deterministic hash-based offset for better variance across tracks
+        hash_input = f"{cache_key}_{idx}"
+        hash_int = int(hashlib.md5(hash_input.encode()).hexdigest()[:8], 16)
+        offset_ratio = (hash_int % 1000) / 1000.0  # More granular than modulo 10
         start_beat = offset_ratio * max(0, total_beats - chunk_beats)
         end_beat = start_beat + chunk_beats
         
@@ -273,19 +342,49 @@ class BeatsDataset(Dataset):
         
         audio_chunk = audio_tokens[start_idx:end_idx]
         notes_chunk = [(t - start_beat, n) for t, n in notes if start_beat <= t < end_beat]
+        
+        return audio_chunk, notes_chunk
 
-        # audio_chunk = (frames, 2)
-        # notes_chunk = [(time, note_type), ...]
+    def _build_sequence(self, audio_chunk: np.ndarray, notes_chunk: List[Tuple[float, int]], idx: int) -> List[int]:  # type: ignore[type-arg]
+        """Build final training sequence with length checking.
+        
+        Args:
+            audio_chunk: Audio tokens, shape (frames, 2)
+            notes_chunk: Note list [(time, note_type), ...]
+            idx: Sample index for logging
+            
+        Returns:
+            Training sequence as list of token IDs
+        """
         sequence = create_training_sequence(audio_chunk, notes_chunk)
         
-        # Check sequence length
+        # Check sequence length and truncate if needed
         if len(sequence) > self.max_seq_length:
-            print(f"[Warning] Sequence too long ({len(sequence)} > {self.max_seq_length}), truncating")
+            logger.warning(f"Sequence too long ({len(sequence)} > {self.max_seq_length}), truncating")
             sequence = sequence[:self.max_seq_length - 1] + [EOS]
         
-        # Debug: print actual sequence length once in a while
-        if idx == 0:  # Only print for first sample to avoid spam
-            print(f"[Debug] Sample {idx} sequence length: {len(sequence)} tokens (audio_frames: {len(audio_chunk)}, notes: {len(notes_chunk)})")
+        # Debug: log actual sequence length once in a while
+        if idx == 0:  # Only log for first sample to avoid spam
+            logger.debug(f"Sample {idx} sequence length: {len(sequence)} tokens (audio_frames: {len(audio_chunk)}, notes: {len(notes_chunk)})")
+        
+        return sequence
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get training sample by orchestrating cache, encode, slice, and build steps."""
+        cache_key = self._get_cache_key(idx)
+        
+        # Step 1: Try to load from cache
+        audio_tokens, notes, bpm = self._load_cache(idx, cache_key)
+        
+        # Step 2: If cache miss, encode audio
+        if audio_tokens is None:
+            audio_tokens, notes, bpm = self._encode_audio(idx, cache_key)
+        
+        # Step 3: Slice into chunks
+        audio_chunk, notes_chunk = self._slice_chunk(audio_tokens, notes, bpm, cache_key, idx)
+        
+        # Step 4: Build final sequence
+        sequence = self._build_sequence(audio_chunk, notes_chunk, idx)
         
         # Return dict format expected by HuggingFace trainer
         return {
