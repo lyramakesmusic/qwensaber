@@ -107,7 +107,12 @@ def audio_masking_collator(batch):
     # batch = [{"input_ids": tensor, "attention_mask": tensor}, ...]
     
     # Find max length in batch for padding
-    max_len = max(item["input_ids"].size(0) for item in batch)
+    # Handle both tensors and lists
+    max_len = max(
+        item["input_ids"].size(0) if torch.is_tensor(item["input_ids"]) 
+        else len(item["input_ids"]) 
+        for item in batch
+    )
     
     # Prepare padded tensors
     input_ids = []
@@ -115,18 +120,22 @@ def audio_masking_collator(batch):
     labels = []
     
     for item in batch:
-        seq_len = item["input_ids"].size(0)
+        # Convert to tensors if needed
+        item_input_ids = item["input_ids"] if torch.is_tensor(item["input_ids"]) else torch.tensor(item["input_ids"], dtype=torch.long)
+        item_attention_mask = item["attention_mask"] if torch.is_tensor(item["attention_mask"]) else torch.tensor(item["attention_mask"], dtype=torch.long)
+        
+        seq_len = item_input_ids.size(0)
         pad_len = max_len - seq_len
         
         # Pad input_ids with PAD token
         padded_input = torch.cat([
-            item["input_ids"],
+            item_input_ids,
             torch.full((pad_len,), PAD, dtype=torch.long)
         ])
         
         # Pad attention_mask with 0s
         padded_mask = torch.cat([
-            item["attention_mask"],
+            item_attention_mask,
             torch.zeros(pad_len, dtype=torch.long)
         ])
         
@@ -135,7 +144,7 @@ def audio_masking_collator(batch):
         
         # Find NOTES_START position
         notes_start_idx = None
-        for j, token in enumerate(item["input_ids"]):
+        for j, token in enumerate(item_input_ids):
             if token == NOTES_START:
                 notes_start_idx = j
                 break
@@ -181,7 +190,6 @@ class BeatsDataset(Dataset):
         # cache_dir for storing encoded audio
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
-        print(f"[Cache] Using directory: {self.cache_dir}")
         
         # encodec model singleton
         self.audio_tokenizer = None
@@ -216,9 +224,7 @@ class BeatsDataset(Dataset):
                     audio_tokens = cached_data['audio_tokens']
                     notes = cached_data['notes']
                     bpm = cached_data['bpm']
-                    print(f"[Cache] Loaded sample {idx} from cache")
             except Exception as e:
-                print(f"[Cache] Failed to load cache: {e}")
                 cache_path.unlink()  # Remove corrupted cache
                 # Fall through to regenerate
                 audio_tokens = None
@@ -231,7 +237,6 @@ class BeatsDataset(Dataset):
             
             # Encode audio with encodec (expensive operation)
             # Note: Encodec model runs on GPU as per spec
-            print(f"[Cache] Encoding sample {idx}...")
             audio_tokens = self._get_audio_tokenizer().encode(audio)
             
             # Save to cache
@@ -243,7 +248,7 @@ class BeatsDataset(Dataset):
                         'bpm': bpm
                     }, f)
             except Exception as e:
-                print(f"[Cache] Failed to save: {e}")
+                pass  # Fail silently, will regenerate next time
 
         # Now do chunking
         bps = bpm / 60
@@ -277,6 +282,10 @@ class BeatsDataset(Dataset):
         if len(sequence) > self.max_seq_length:
             print(f"[Warning] Sequence too long ({len(sequence)} > {self.max_seq_length}), truncating")
             sequence = sequence[:self.max_seq_length - 1] + [EOS]
+        
+        # Debug: print actual sequence length once in a while
+        if idx == 0:  # Only print for first sample to avoid spam
+            print(f"[Debug] Sample {idx} sequence length: {len(sequence)} tokens (audio_frames: {len(audio_chunk)}, notes: {len(notes_chunk)})")
         
         # Return dict format expected by HuggingFace trainer
         return {

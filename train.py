@@ -6,7 +6,6 @@ import unsloth  # Must be first for patching
 from unsloth import FastLanguageModel
 
 import argparse
-from datasets import Dataset as HFDataset
 from transformers import TrainingArguments
 from trl import SFTTrainer
 
@@ -43,25 +42,18 @@ def train(args):
         max_seq_length=args.max_seq_length
     )
     
-    # Convert to HuggingFace dataset
-    n_samples = min(args.max_samples or len(dataset), len(dataset))
-    print(f"[Dataset] Loading {n_samples} samples...")
+    # Limit samples if needed
+    if args.max_samples is not None:
+        dataset = torch.utils.data.Subset(dataset, range(min(args.max_samples, len(dataset))))
     
-    sequences = [dataset[i] for i in range(n_samples)]
-    # sequences = List[Dict[str, tensor]] - tokenized training sequences
-    hf_dataset = HFDataset.from_dict({"sequences": sequences})
-    
-    if not sequences:
-        print("[Error] No samples found! Check your dataset directory.")
-        return
-    
-    print(f"[Dataset] Ready with {len(sequences)} samples")
+    print(f"[Dataset] Ready with {len(dataset)} samples")
 
-    # Train
+    # Train (using SFTTrainer like in the working example)
     trainer = SFTTrainer(
         model=model,
-        train_dataset=hf_dataset,
-        data_collator=audio_masking_collator,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        data_collator=lambda batch: audio_masking_collator(batch),
         args=TrainingArguments(
             output_dir=args.output_dir,
             per_device_train_batch_size=1,
