@@ -1,4 +1,4 @@
-# Beat Saber AI
+# Qwensaber
 
 Beat Saber map generation from audio based on Qwen-0.6b.
 
